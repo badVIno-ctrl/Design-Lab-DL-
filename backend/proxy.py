@@ -1,0 +1,601 @@
+"""/api/proxy — same-origin relay to allow-listed AI providers.
+
+Правила:
+- только для вошедших пользователей — сервер подставляет свои ключи;
+- адрес апстрима строит сам сервер по модели, затем по provider или host;
+  параметр url от клиента используется только чтобы опознать провайдера;
+- тариф решает, какие модели доступны и сколько генераций в сутки;
+- размер тела запроса ограничен MAX_PROXY_BODY (по умолчанию 2 МБ);
+- Gemini — единственный случай с моделью в пути, там разрешены только
+  :generateContent и :streamGenerateContent;
+- авторедиректы выключены, чтобы ключ не ушёл на чужой хост.
+"""
+import json
+import os
+import secrets as _secrets
+import threading
+from urllib.parse import urlparse, unquote, urlunparse
+
+import httpx
+from fastapi import APIRouter, Depends, Header, Request, HTTPException
+from fastapi.responses import Response, StreamingResponse
+
+from . import config
+from . import seekai
+from .auth import require_user
+from .plans import consume_edit, ensure_model_allowed
+from .ratelimit import guard
+
+router = APIRouter(prefix="/api", tags=["proxy"])
+
+MAX_PROXY_BODY = int(os.getenv("MAX_PROXY_BODY", str(2 * 1024 * 1024)))
+
+_GOOGLE_HOST = "generativelanguage.googleapis.com"
+_GOOGLE_ENV = "GEMINI_API_KEYS,GEMINI_API_KEY"
+_GOOGLE_METHODS = (":generateContent", ":streamGenerateContent")
+
+_GOROUTER_ENV = "GOROUTER_API_KEYS,GOROUTER_API_KEY"
+_GOROUTER_BASE = os.getenv("GOROUTER_BASE_URL", "https://gorouter.app/v1").rstrip("/")
+_GOROUTER_ENDPOINT = _GOROUTER_BASE + "/chat/completions"
+_GOROUTER_MODELS = {
+    "claude-opus-4-8",
+    "claude-opus-4-8-thinking",
+    "claude-opus-5",
+    "claude-opus-5-thinking",
+}
+
+_KIWI_ENV = "KIWILLM_API_KEYS,KIWILLM_API_KEY,KIWI_KEY"
+_KIWI_BASE = os.getenv("KIWILLM_BASE_URL", "https://api.kiwillm.in/v1").rstrip("/")
+_KIWI_ENDPOINT = _KIWI_BASE + "/chat/completions"
+_KIWI_MODELS = {"DeepSeek-V4-Flash", "kiwi::glm-5.2", "Qwen3.6-35B-A3B"}
+
+_VYCE_ENV = "VYCE_API_KEYS,VYCE_API_KEY"
+_VYCE_BASE = os.getenv("VYCE_BASE_URL", "https://vyceai.com/v1").rstrip("/")
+_VYCE_ENDPOINT = _VYCE_BASE + "/chat/completions"
+_VYCE_MODELS = {
+    "auto", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5",
+    "claude-fable-5", "deepseek-v4-flash", "gemini-3.6-flash",
+    "gemini-3.1-flash-lite", "glm-5.2", "minimax-m3", "mimo-v2.5-pro",
+    "gpt-5.6-sol",
+}
+
+_CEREBRAS_ENV = "CEREBRAS_API_KEYS,CEREBRAS_API_KEY"
+_CEREBRAS_BASE = os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1").rstrip("/")
+_CEREBRAS_ENDPOINT = _CEREBRAS_BASE + "/chat/completions"
+_CEREBRAS_MODELS = {"zai-glm-4.7", "gpt-oss-120b", "gemma-4-31b"}
+
+# FreeRouter (https://freerouter.eu.cc) — добавлен 22 августа.
+# Имена моделей идут с префиксом fr:: НАМЕРЕННО: glm-5.2 занят Vyce,
+# а gpt-5-6-luna — собственная модель SeekAI. Без префикса FreeRouter
+# перехватывал бы чужие строки меню. Настоящее имя подставляется
+# в _MODEL_ALIASES перед отправкой в апстрим.
+# Вечером 22 августа их origin лёг (502 origin_bad_gateway через Cloudflare),
+# и модели убраны из меню. Серверная часть оставлена целиком: поднимут шлюз —
+# хватит вернуть флаг DL_FREEROUTER_ENABLED в frontend/models-patch.js.
+_FREEROUTER_ENV = "FREEROUTER_API_KEYS,FREEROUTER_API_KEY"
+_FREEROUTER_BASE = os.getenv("FREEROUTER_BASE_URL", "https://freerouter.eu.cc/v1").rstrip("/")
+_FREEROUTER_ENDPOINT = _FREEROUTER_BASE + "/chat/completions"
+_FREEROUTER_MODELS = {
+    "fr::gpt-5-6-luna",
+    "fr::glm-5.2",
+    "fr::kimi-k3",
+    "fr::qwen3.8-max",
+    "fr::deepseek-v4-pro-0813",
+}
+
+# TeamoRouter (https://api.teamorouter.com) и OrcaRouter (https://api.orcarouter.ai)
+# добавлены 22 августа вместо FreeRouter. Оба говорят на обычном OpenAI-протоколе,
+# отличается только адрес и ключ.
+# Приставка вроде fr:: здесь НЕ нужна, и это проверено, а не предположено:
+# deepseek-v4-flash-free, deepseek-v4-pro-free и qwen/qwen3.8-27b-free ни с чем
+# в _MODEL_PROVIDER не совпадают — у Vyce модель зовётся deepseek-v4-flash,
+# без -free, а у SeekAI deepseek-v4-pro. Появится тёзка — добавляй приставку
+# и строку в _MODEL_ALIASES, иначе запрос уйдёт чужому провайдеру.
+_TEAMOROUTER_ENV = "TEAMOROUTER_API_KEYS,TEAMOROUTER_API_KEY"
+_TEAMOROUTER_BASE = os.getenv("TEAMOROUTER_BASE_URL", "https://api.teamorouter.com/v1").rstrip("/")
+_TEAMOROUTER_ENDPOINT = _TEAMOROUTER_BASE + "/chat/completions"
+_TEAMOROUTER_MODELS = {
+    "deepseek-v4-flash-free",
+    "deepseek-v4-pro-free",
+}
+
+_ORCAROUTER_ENV = "ORCAROUTER_API_KEYS,ORCAROUTER_API_KEY"
+_ORCAROUTER_BASE = os.getenv("ORCAROUTER_BASE_URL", "https://api.orcarouter.ai/v1").rstrip("/")
+_ORCAROUTER_ENDPOINT = _ORCAROUTER_BASE + "/chat/completions"
+# orcarouter/auto в меню нет, но маршрут для него оставлен: пригодится,
+# если решим добавить их авто-выбор строкой в models-patch.js.
+_ORCAROUTER_MODELS = {
+    "qwen/qwen3.8-27b-free",
+    "orcarouter/auto",
+}
+
+_OPENROUTER_ENV = "OPENROUTER_API_KEYS,OPENROUTER_API_KEY"
+_OPENROUTER_BASE = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+_OPENROUTER_ENDPOINT = _OPENROUTER_BASE + "/chat/completions"
+
+_GLM_ENV = "GLM_API_KEYS,GLM_API_KEY"
+_GLM_BASE = os.getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
+_GLM_ENDPOINT = _GLM_BASE + "/chat/completions"
+
+_MISTRAL_ENV = "MISTRAL_API_KEYS,MISTRAL_API_KEY"
+_MISTRAL_BASE = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1").rstrip("/")
+_MISTRAL_ENDPOINT = _MISTRAL_BASE + "/chat/completions"
+
+_PROVIDERS = {
+    "seekai": (seekai.ENDPOINT, seekai.ENV_NAMES, "bearer"),
+    "gorouter": (_GOROUTER_ENDPOINT, _GOROUTER_ENV, "bearer"),
+    "kiwi": (_KIWI_ENDPOINT, _KIWI_ENV, "bearer"),
+    "vyce": (_VYCE_ENDPOINT, _VYCE_ENV, "bearer"),
+    "cerebras": (_CEREBRAS_ENDPOINT, _CEREBRAS_ENV, "bearer"),
+    "freerouter": (_FREEROUTER_ENDPOINT, _FREEROUTER_ENV, "bearer"),
+    "teamorouter": (_TEAMOROUTER_ENDPOINT, _TEAMOROUTER_ENV, "bearer"),
+    "orcarouter": (_ORCAROUTER_ENDPOINT, _ORCAROUTER_ENV, "bearer"),
+    "openrouter": (_OPENROUTER_ENDPOINT, _OPENROUTER_ENV, "bearer"),
+    "glm": (_GLM_ENDPOINT, _GLM_ENV, "bearer"),
+    "mistral": (_MISTRAL_ENDPOINT, _MISTRAL_ENV, "bearer"),
+}
+
+_MODEL_ALIASES = {
+    "kiwi::glm-5.2": "glm-5.2",
+    "fr::gpt-5-6-luna": "gpt-5-6-luna",
+    "fr::glm-5.2": "glm-5.2",
+    "fr::kimi-k3": "kimi-k3",
+    "fr::qwen3.8-max": "qwen3.8-max",
+    "fr::deepseek-v4-pro-0813": "deepseek-v4-pro-0813",
+}
+_MODEL_PROVIDER = {}
+for _model in _VYCE_MODELS:
+    _MODEL_PROVIDER[_model] = "vyce"
+for _model in _KIWI_MODELS:
+    _MODEL_PROVIDER[_model] = "kiwi"
+for _model in _GOROUTER_MODELS:
+    _MODEL_PROVIDER[_model] = "gorouter"
+for _model in _CEREBRAS_MODELS:
+    _MODEL_PROVIDER[_model] = "cerebras"
+for _model in _FREEROUTER_MODELS:
+    _MODEL_PROVIDER[_model] = "freerouter"
+for _model in _TEAMOROUTER_MODELS:
+    _MODEL_PROVIDER[_model] = "teamorouter"
+for _model in _ORCAROUTER_MODELS:
+    _MODEL_PROVIDER[_model] = "orcarouter"
+for _model in seekai.OWN_MODELS:
+    _MODEL_PROVIDER.setdefault(_model, "seekai")
+
+_HOST_PROVIDER = {
+    "gorouter.app": "gorouter",
+    "www.gorouter.app": "gorouter",
+    "api.kiwillm.in": "kiwi",
+    "vyceai.com": "vyce",
+    "www.vyceai.com": "vyce",
+    "api.cerebras.ai": "cerebras",
+    "freerouter.eu.cc": "freerouter",
+    "www.freerouter.eu.cc": "freerouter",
+    "api.teamorouter.com": "teamorouter",
+    "teamorouter.com": "teamorouter",
+    "api.orcarouter.ai": "orcarouter",
+    "orcarouter.ai": "orcarouter",
+    "openrouter.ai": "openrouter",
+    "open.bigmodel.cn": "glm",
+    "api.mistral.ai": "mistral",
+    "seekai.cc": "seekai",
+    "www.seekai.cc": "seekai",
+}
+
+_counters = {}
+_lock = threading.Lock()
+
+
+def admin_only(x_admin_token: str = Header(None)):
+    expected = config.ADMIN_API_TOKEN
+    # compare_digest на строках падает TypeError, если в заголовке есть не-ASCII:
+    # вместо 404 «такого нет» получался 500 с трассировкой. Сравниваем байты.
+    if not expected or not x_admin_token:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not _secrets.compare_digest(x_admin_token.encode("utf-8"), expected.encode("utf-8")):
+        raise HTTPException(status_code=404, detail="Not Found")
+    return True
+
+
+async def read_limited_body(request: Request) -> bytes:
+    """Читает тело запроса, но не больше MAX_PROXY_BODY байт."""
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            length = int(declared)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Некорректный Content-Length")
+        if length > MAX_PROXY_BODY:
+            raise HTTPException(status_code=413, detail="Запрос слишком большой")
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_PROXY_BODY:
+            raise HTTPException(status_code=413, detail="Запрос слишком большой")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _keys(env_names: str):
+    out = []
+    for name in env_names.split(","):
+        out += [key.strip() for key in os.getenv(name.strip(), "").split(",") if key.strip()]
+    return out
+
+
+def _next_key(host: str, keys):
+    if not keys:
+        return None
+    with _lock:
+        index = _counters.get(host, 0) % len(keys)
+        _counters[host] = (index + 1) % len(keys)
+    return keys[index]
+
+
+def _model_of(body: bytes) -> str:
+    try:
+        data = json.loads(body.decode("utf-8", "ignore"))
+    except (ValueError, AttributeError):
+        return ""
+    model = data.get("model") if isinstance(data, dict) else None
+    return model.strip() if isinstance(model, str) else ""
+
+
+def _rewrite_model(body: bytes, model: str) -> bytes:
+    real_model = _MODEL_ALIASES.get(model)
+    if not real_model:
+        return body
+    try:
+        data = json.loads(body.decode("utf-8", "ignore"))
+        data["model"] = real_model
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (ValueError, AttributeError, TypeError):
+        return body
+
+
+def _split(target: str):
+    parsed = urlparse(target)
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=403, detail="разрешён только https")
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    # netloc пересобираем из проверенного hostname, а не берём как есть.
+    # В исходном netloc может быть userinfo (https://кто-то:пароль@host/…):
+    # проверку хоста оно проходит, потому что hostname его отбрасывает, а вот
+    # в апстрим уходил бы адрес с чужими учётными данными в заголовке.
+    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    clean = urlunparse((parsed.scheme, netloc, path, "", "", ""))
+    return clean, host, path
+
+
+def _google_target(target: str):
+    clean, host, path = _split(target)
+    if host != _GOOGLE_HOST:
+        return None
+    starts = path.startswith("/v1beta/models/") or path.startswith("/v1/models/")
+    if not starts or not path.endswith(_GOOGLE_METHODS) or ".." in path:
+        raise HTTPException(status_code=403, detail="endpoint not allowed")
+    return clean, host, _GOOGLE_ENV, "goog", "google"
+
+
+def _resolve(request: Request, target: str, model: str):
+    name = _MODEL_PROVIDER.get(model, "")
+    if not name:
+        name = (request.query_params.get("provider") or "").strip().lower()
+    if not name and target:
+        google = _google_target(target)
+        if google:
+            return google
+        name = _HOST_PROVIDER.get(_split(target)[1], "")
+    if not name:
+        raise HTTPException(status_code=403, detail="provider not allowed")
+    entry = _PROVIDERS.get(name)
+    if not entry:
+        raise HTTPException(status_code=403, detail=f"provider not allowed: {name}")
+    endpoint, env_names, auth = entry
+    host = (urlparse(endpoint).hostname or "").lower()
+    return endpoint, host, env_names, auth, name
+
+
+def _headers_for(host: str, key: str, auth: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Accept-Encoding": "identity",
+    }
+    if auth == "goog":
+        headers["x-goog-api-key"] = key
+    else:
+        headers["Authorization"] = "Bearer " + key
+        if host == "openrouter.ai":
+            headers["HTTP-Referer"] = os.getenv("PUBLIC_URL", "https://desing-lab.onrender.com")
+            headers["X-Title"] = "Design Lab"
+    return headers
+
+
+def _is_challenge(content_type: str, data: bytes) -> bool:
+    if "html" not in content_type.lower():
+        return False
+    head = data[:4096].decode("utf-8", "ignore").lower()
+    return (
+        "just a moment" in head or "cf_chl_opt" in head
+        or "cf-browser-verification" in head or "cf_app_waf" in head
+    )
+
+
+def _error_response(message: str, status: int = 502) -> Response:
+    payload = json.dumps({"error": {"message": message}}, ensure_ascii=False)
+    return Response(content=payload, status_code=status, media_type="application/json")
+
+
+def _set_model(body: bytes, model: str) -> bytes:
+    """Подменяет имя модели в теле запроса."""
+    try:
+        data = json.loads(body.decode("utf-8", "ignore"))
+        if not isinstance(data, dict):
+            return body
+        data["model"] = model
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (ValueError, AttributeError, TypeError):
+        return body
+
+
+async def _open_upstream(target: str, body: bytes, headers: dict):
+    """Открывает потоковый запрос. Возвращает (client, response, error)."""
+    client = httpx.AsyncClient(timeout=config.AI_TIMEOUT, follow_redirects=False)
+    try:
+        upstream_request = client.build_request("POST", target, content=body, headers=headers)
+        response = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        return None, None, f"{type(exc).__name__}: {exc}".rstrip()
+    return client, response, ""
+
+
+async def _drain(client, response) -> bytes:
+    data = await response.aread()
+    await response.aclose()
+    await client.aclose()
+    return data
+
+
+async def _attempt(provider: str, target: str, host: str, env_names: str, auth: str, body: bytes):
+    """Одна попытка к одному шлюзу.
+
+    Возвращает dict: ok / failed(retryable) / готовый ответ клиенту.
+    """
+    if provider == "seekai":
+        pool = seekai.keys()
+    else:
+        pool = _keys(env_names)
+    key = _next_key(host, pool)
+    if not key:
+        first = env_names.split(",")[0]
+        return {"state": "failed", "status": 503,
+                "message": f"нет ключа для {host} — задай {first} в .env"}
+
+    headers = _headers_for(host, key, auth)
+    client, response, error = await _open_upstream(target, body, headers)
+    if error:
+        return {"state": "failed", "status": 502, "message": f"upstream error: {error}"}
+
+    if 300 <= response.status_code < 400:
+        await response.aclose()
+        await client.aclose()
+        message = f"{host}: провайдер просит перейти на другой адрес ({response.status_code})."
+        return {"state": "failed", "status": 502, "message": message}
+
+    content_type = response.headers.get("content-type", "application/json")
+    if "html" in content_type.lower():
+        data = await _drain(client, response)
+        if _is_challenge(content_type, data):
+            message = f"{host}: запрос заблокирован проверкой браузера Cloudflare."
+        else:
+            message = f"{host}: вместо ответа API вернулась HTML-страница (код {response.status_code})."
+        return {"state": "failed", "status": 502, "message": message}
+
+    if response.status_code >= 400:
+        data = await _drain(client, response)
+        return {"state": "failed", "status": response.status_code,
+                "raw": data, "contentType": content_type}
+
+    return {"state": "ok", "client": client, "response": response, "contentType": content_type}
+
+
+def _stream(client, response) -> StreamingResponse:
+    async def generate():
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        generate(),
+        status_code=response.status_code,
+        media_type=response.headers.get("content-type", "application/json"),
+    )
+
+
+@router.api_route("/proxy", methods=["POST"])
+async def proxy(request: Request, user=Depends(require_user)):
+    guard("proxy", request, user)
+    raw = request.query_params.get("url")
+    target = unquote(raw) if raw else ""
+    body = await read_limited_body(request)
+
+    model = _model_of(body)
+    target, host, env_names, auth, provider = _resolve(request, target, model)
+    ensure_model_allowed(user, provider, model)
+    consume_edit(user)
+    body = _rewrite_model(body, model)
+
+    seek_model = seekai.target_model(model)
+    seek_ready = bool(seek_model and seekai.enabled())
+    seek_host = (urlparse(seekai.ENDPOINT).hostname or "").lower()
+
+    # Имена моделей на сайте и в каталоге SeekAI совпадают не всегда
+    # (у них есть и gpt-5.6, и gpt-5-6-terra). Раньше перевод имени делался
+    # только для резервных запросов, а собственные модели SeekAI уходили как есть
+    # и получали «model not found», после чего сайт молча брал следующую модель.
+    if provider == "seekai" and seek_model and seek_model != model:
+        body = _set_model(body, seek_model)
+
+    # Если родной шлюз уже помечен как выдохшийся — сразу идём в SeekAI.
+    skip_primary = provider != "seekai" and seek_ready and seekai.is_exhausted(provider, model)
+
+    last = None
+    if not skip_primary:
+        last = await _attempt(provider, target, host, env_names, auth, body)
+        if last["state"] == "ok":
+            seekai.mark_alive(provider, model)
+            return _stream(last["client"], last["response"])
+        if provider != "seekai" and last.get("status") in seekai.EXHAUSTED_CODES:
+            seekai.mark_exhausted(provider, model)
+        if not (seek_ready and provider != "seekai"):
+            if "raw" in last:
+                return Response(content=last["raw"], status_code=last["status"],
+                                media_type=last.get("contentType", "application/json"))
+            return _error_response(last["message"], last["status"])
+
+    # Резерв: три ключа SeekAI с тем же запросом.
+    seek_body = _set_model(body, seek_model)
+    attempts = max(1, min(len(seekai.keys()), 3))
+    seek_last = None
+    for _ in range(attempts):
+        seek_last = await _attempt("seekai", seekai.ENDPOINT, seek_host,
+                                   seekai.ENV_NAMES, "bearer", seek_body)
+        if seek_last["state"] == "ok":
+            return _stream(seek_last["client"], seek_last["response"])
+        if seek_last.get("status") not in seekai.EXHAUSTED_CODES:
+            break
+
+    if seek_last and "raw" in seek_last:
+        return Response(content=seek_last["raw"], status_code=seek_last["status"],
+                        media_type=seek_last.get("contentType", "application/json"))
+    detail = (seek_last or {}).get("message") or "SeekAI не ответил"
+    if last and last.get("message"):
+        detail = last["message"] + " Резерв SeekAI тоже не сработал: " + detail
+    return _error_response(detail, (seek_last or {}).get("status", 502))
+
+
+async def _probe(base: str, env_names: str, paths=("models",)):
+    keys = _keys(env_names)
+    if not keys:
+        first = env_names.split(",")[0]
+        return {"ok": False, "base": base, "keys": 0, "reason": "no_key", "message": f"Не задан {first} в переменных окружения."}
+    host = (urlparse(base).hostname or "").lower()
+    headers = _headers_for(host, keys[0], "bearer")
+    checks = {}
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+        for path in paths:
+            entry = {"url": f"{base}/{path}"}
+            try:
+                response = await client.get(entry["url"], headers=headers)
+            except httpx.HTTPError as exc:
+                entry.update(reason="network_error", message=f"{type(exc).__name__}: {exc}".rstrip())
+                checks[path] = entry
+                continue
+            content_type = response.headers.get("content-type", "")
+            entry.update(status=response.status_code, contentType=content_type, cfRay=response.headers.get("cf-ray"))
+            if _is_challenge(content_type, response.content):
+                entry.update(reason="cloudflare_challenge", message="Провайдер вернул проверку браузера вместо API.")
+            elif 300 <= response.status_code < 400:
+                entry.update(reason="redirect", location=response.headers.get("location", ""))
+            elif response.status_code in (404, 405, 501):
+                entry.update(reason="unsupported_endpoint", body=response.text[:300])
+            elif response.status_code in (401, 403):
+                entry.update(reason="auth_error", body=response.text[:300])
+            elif response.status_code >= 400:
+                entry.update(reason="http_error", body=response.text[:300])
+            else:
+                entry.update(reason="ok", body=response.text[:500])
+            checks[path] = entry
+    ok = any(check.get("reason") == "ok" for check in checks.values())
+    return {"ok": ok, "base": base, "keys": len(keys), "checks": checks}
+
+
+@router.get("/gorouter/check")
+async def gorouter_check(_admin=Depends(admin_only)):
+    return await _probe(_GOROUTER_BASE, _GOROUTER_ENV)
+
+
+@router.get("/kiwi/check")
+async def kiwi_check(_admin=Depends(admin_only)):
+    return await _probe(_KIWI_BASE, _KIWI_ENV)
+
+
+@router.get("/vyce/check")
+async def vyce_check(_admin=Depends(admin_only)):
+    return await _probe(_VYCE_BASE, _VYCE_ENV, ("models", "me"))
+
+
+@router.get("/freerouter/check")
+async def freerouter_check(_admin=Depends(admin_only)):
+    return await _probe(_FREEROUTER_BASE, _FREEROUTER_ENV)
+
+
+@router.get("/teamorouter/check")
+async def teamorouter_check(_admin=Depends(admin_only)):
+    return await _probe(_TEAMOROUTER_BASE, _TEAMOROUTER_ENV)
+
+
+@router.get("/orcarouter/check")
+async def orcarouter_check(_admin=Depends(admin_only)):
+    return await _probe(_ORCAROUTER_BASE, _ORCAROUTER_ENV)
+
+
+async def _seekai_catalog():
+    """Полный список моделей шлюза и сверка с нашими именами.
+
+    Обычная проверка режет тело ответа на 500 символах, и по ней невозможно
+    понять, есть ли у провайдера конкретная модель. Здесь возвращаем
+    только идентификаторы и сразу показываем, каких из наших имён там нет.
+    """
+    pool = seekai.keys()
+    if not pool:
+        return {"ok": False, "reason": "no_key"}
+    host = (urlparse(seekai.BASE_URL).hostname or "").lower()
+    headers = _headers_for(host, pool[0], "bearer")
+    url = seekai.BASE_URL + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        return {"ok": False, "reason": "network_error", "message": f"{type(exc).__name__}: {exc}".rstrip()}
+    try:
+        data = response.json()
+    except ValueError:
+        return {"ok": False, "reason": "bad_json", "status": response.status_code,
+                "body": response.text[:300]}
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return {"ok": False, "reason": "unexpected_shape", "status": response.status_code,
+                "body": response.text[:300]}
+    ids = sorted(str(item.get("id", "")) for item in items if isinstance(item, dict))
+    known = set(ids)
+    missing_own = sorted(
+        name for name in seekai.OWN_MODELS
+        if (seekai.target_model(name) or name) not in known
+    )
+    missing_failover = sorted(
+        {target for target in seekai.FALLBACK_MODEL.values() if target not in known}
+    )
+    return {
+        "ok": True,
+        "status": response.status_code,
+        "count": len(ids),
+        "ids": ids,
+        "missingOwnModels": missing_own,
+        "missingFailoverTargets": missing_failover,
+    }
+
+
+@router.get("/seekai/check")
+async def seekai_check(_admin=Depends(admin_only)):
+    """Состояние SeekAI + список провайдеров, у которых кончились лимиты."""
+    report = await _probe(seekai.BASE_URL, seekai.ENV_NAMES)
+    report["failover"] = seekai.status()
+    report["catalog"] = await _seekai_catalog()
+    return report
