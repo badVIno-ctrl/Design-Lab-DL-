@@ -1,0 +1,58 @@
+# Render.com Blueprint — one-click deploy.
+services:
+  - type: web
+    name: design-lab
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: STORE
+        value: json
+      # Проекты и API только для вошедших пользователей.
+      - key: AUTH_ENABLED
+        value: "1"
+      - key: CORS_ORIGINS
+        value: "https://desing-lab.onrender.com"
+      # Один балансировщик Render перед приложением — от этого зависят лимиты.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      # Доступ к /api/admin/* и /api/*/check (заголовок X-Admin-Token).
+      - key: ADMIN_API_TOKEN
+        generateValue: true
+      # Base URL of a separate persistent service for users, sessions and projects.
+      - key: USER_DB_SERVICE_URL
+        sync: false
+      # Служебный токен того же сервиса: без него смена тарифа даёт 502.
+      - key: SERVICE_API_TOKEN
+        sync: false
+      # Секрет входа через GitHub. Без него /api/auth/github отвечает 503.
+      - key: GITHUB_LOGIN_SECRET
+        generateValue: true
+      # AI provider keys for /api/proxy (comma-separated for several keys).
+      - key: SEEKAI_API_KEYS
+        sync: false
+      - key: SEEKAI_FAILOVER_COOLDOWN
+        value: "900"
+      - key: GOROUTER_API_KEYS
+        sync: false
+      - key: KIWILLM_API_KEYS
+        sync: false
+      - key: VYCE_API_KEYS
+        sync: false
+      - key: CEREBRAS_API_KEYS
+        sync: false
+      - key: OPENROUTER_API_KEYS
+        sync: false
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: GLM_API_KEYS
+        sync: false
+      - key: MISTRAL_API_KEYS
+        sync: false
+      - key: OCR_SPACE_API_KEYS
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
